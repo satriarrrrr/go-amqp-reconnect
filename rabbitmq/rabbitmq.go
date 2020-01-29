@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"sync"
 	"time"
 
 	"sync/atomic"
@@ -8,22 +9,43 @@ import (
 	"github.com/streadway/amqp"
 )
 
-const delay = 3 // reconnect after delay seconds
+const (
+	delay    = 1 // reconnect after delay seconds
+	maxDelay = 5 // max delay seconds
+)
 
 // Connection amqp.Connection wrapper
 type Connection struct {
 	*amqp.Connection
+	mu *sync.RWMutex
+}
+
+func (c *Connection) setConnection(conn *amqp.Connection) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.Connection = conn
+}
+
+func (c *Connection) getConnection() *amqp.Connection {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.Connection
 }
 
 // Channel wrap amqp.Connection.Channel, get a auto reconnect channel
 func (c *Connection) Channel() (*Channel, error) {
+	c.mu.RLock()
 	ch, err := c.Connection.Channel()
+	c.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
 
 	channel := &Channel{
 		Channel: ch,
+		mu:      &sync.RWMutex{},
 	}
 
 	go func() {
@@ -35,21 +57,23 @@ func (c *Connection) Channel() (*Channel, error) {
 				channel.Close() // close again, ensure closed flag set when connection closed
 				break
 			}
-			debug("channel closed, reason: %v", reason)
+			debugf("channel closed, reason: %s\n", reason)
 
 			// reconnect if not closed by developer
+			counter := 1
 			for {
-				// wait 1s for connection reconnect
-				time.Sleep(delay * time.Second)
-
+				c.mu.RLock()
 				ch, err := c.Connection.Channel()
+				c.mu.RUnlock()
 				if err == nil {
 					debug("channel recreate success")
-					channel.Channel = ch
+					channel.setChannel(ch)
 					break
 				}
+				debugf("channel recreate failed, retrying in %d second(s) | err: %v \n", counter*delay, err)
 
-				debugf("channel recreate failed, err: %v", err)
+				time.Sleep(time.Duration(counter*delay) * time.Second)
+				counter = (counter + 1) % maxDelay
 			}
 		}
 
@@ -67,11 +91,14 @@ func Dial(url string) (*Connection, error) {
 
 	connection := &Connection{
 		Connection: conn,
+		mu:         &sync.RWMutex{},
 	}
 
 	go func() {
 		for {
+			connection.mu.RLock()
 			reason, ok := <-connection.Connection.NotifyClose(make(chan *amqp.Error))
+			connection.mu.RUnlock()
 			// exit this goroutine if closed by developer
 			if !ok {
 				debug("connection closed")
@@ -80,18 +107,18 @@ func Dial(url string) (*Connection, error) {
 			debugf("connection closed, reason: %v", reason)
 
 			// reconnect if not closed by developer
+			counter := 1
 			for {
-				// wait 1s for reconnect
-				time.Sleep(delay * time.Second)
-
 				conn, err := amqp.Dial(url)
 				if err == nil {
-					connection.Connection = conn
-					debugf("reconnect success")
+					connection.setConnection(conn)
+					debug("reconnect success")
 					break
 				}
+				debugf("reconnect failed, retrying in %d second(s) | err: %v \n", counter*delay, err)
 
-				debugf("reconnect failed, err: %v", err)
+				time.Sleep(time.Duration(counter*delay) * time.Second)
+				counter = (counter + 1) % maxDelay
 			}
 		}
 	}()
@@ -103,11 +130,19 @@ func Dial(url string) (*Connection, error) {
 type Channel struct {
 	*amqp.Channel
 	closed int32
+	mu     *sync.RWMutex
 }
 
 // IsClosed indicate closed by developer
 func (ch *Channel) IsClosed() bool {
 	return (atomic.LoadInt32(&ch.closed) == 1)
+}
+
+func (ch *Channel) setChannel(c *amqp.Channel) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
+	ch.Channel = c
 }
 
 // Close ensure closed flag set
@@ -118,16 +153,21 @@ func (ch *Channel) Close() error {
 
 	atomic.StoreInt32(&ch.closed, 1)
 
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
 	return ch.Channel.Close()
 }
 
-// Consume warp amqp.Channel.Consume, the returned delivery will end only when channel closed by developer
+// Consume wrap amqp.Channel.Consume, the returned delivery will end only when channel closed by developer
 func (ch *Channel) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error) {
 	deliveries := make(chan amqp.Delivery)
 
 	go func() {
 		for {
+			ch.mu.RLock()
 			d, err := ch.Channel.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
+			ch.mu.RUnlock()
 			if err != nil {
 				debugf("consume failed, err: %v", err)
 				time.Sleep(delay * time.Second)
@@ -148,4 +188,12 @@ func (ch *Channel) Consume(queue, consumer string, autoAck, exclusive, noLocal, 
 	}()
 
 	return deliveries, nil
+}
+
+// Publish wrap amqp.Channel.Publish
+func (ch *Channel) Publish(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
+	return ch.Channel.Publish(exchange, key, mandatory, immediate, msg)
 }
